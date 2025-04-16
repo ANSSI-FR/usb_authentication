@@ -1,0 +1,50 @@
+From 8085f0b47bc91051d9b457e1e716a6ceae4c3375 Mon Sep 17 00:00:00 2001
+From: Nicolas Bouchinet <nicolas.bouchinet@ssi.gouv.fr>
+Date: Thu, 17 Apr 2025 11:07:13 +0200
+Subject: [PATCH 4/4] usb: core: Add Kconfig option to compile usb
+ authorization
+
+This enables the usb authentication protocol implementation.
+
+Co-developed-by: Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
+Signed-off-by: Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
+Signed-off-by: Nicolas Bouchinet <nicolas.bouchinet@ssi.gouv.fr>
+---
+ drivers/usb/core/Kconfig  | 8 ++++++++
+ drivers/usb/core/Makefile | 4 ++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/drivers/usb/core/Kconfig b/drivers/usb/core/Kconfig
+index 58e3ca7e47939..07ba67137b7fe 100644
+--- a/drivers/usb/core/Kconfig
++++ b/drivers/usb/core/Kconfig
+@@ -143,3 +143,11 @@ config USB_DEFAULT_AUTHORIZATION_MODE
+ 	  ACPI selecting value 2 is analogous to selecting value 0.
+ 
+ 	  If unsure, keep the default value.
++
++config USB_AUTHENTICATION
++	bool "Enable USB authentication function"
++	default n
++	depends on USB
++	help
++		Enables the USB Authentication function. This activates the
++		hook points in the USB stack.
+diff --git a/drivers/usb/core/Makefile b/drivers/usb/core/Makefile
+index ac006abd13b3a..7ba1a89cf3de7 100644
+--- a/drivers/usb/core/Makefile
++++ b/drivers/usb/core/Makefile
+@@ -8,6 +8,10 @@ usbcore-y += config.o file.o buffer.o sysfs.o endpoint.o
+ usbcore-y += devio.o notify.o generic.o quirks.o devices.o
+ usbcore-y += phy.o port.o
+ 
++ifdef CONFIG_USB_AUTHENTICATION
++usbcore-y += authent.o authent_netlink.o
++endif
++
+ usbcore-$(CONFIG_OF)		+= of.o
+ usbcore-$(CONFIG_USB_PCI)		+= hcd-pci.o
+ usbcore-$(CONFIG_ACPI)		+= usb-acpi.o
+-- 
+2.50.0
+

@@ -1,0 +1,218 @@
+From 2314188049b13e7de68f721e6f0fc72eed361e1a Mon Sep 17 00:00:00 2001
+From: Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
+Date: Thu, 12 Jun 2025 15:25:36 +0200
+Subject: [PATCH 3/3] usb/auth: Add qemu cmdline option
+
+Add a new option to provide a configuration in json format.
+The file content is described in include/hw/usb/dev-auth.h
+
+Co-authored-by: Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
+Co-authored-by: Nicolas Bouchinet <nicolas.bouchinet@ssi.gouv.fr>
+---
+ hw/core/machine.c                 |  1 +
+ qemu-options.hx                   | 34 ++++++++++++++++++-------------
+ scripts/vmstate-static-checker.py |  1 +
+ system/vl.c                       | 20 ++++++++++++++++++
+ 4 files changed, 42 insertions(+), 14 deletions(-)
+
+diff --git a/hw/core/machine.c b/hw/core/machine.c
+index 4ff60911e7..376f9311ce 100644
+--- a/hw/core/machine.c
++++ b/hw/core/machine.c
+@@ -180,6 +180,7 @@ GlobalProperty hw_compat_3_1[] = {
+     { "tpm-tis", "ppi", "false" },
+     { "usb-kbd", "serial", "42" },
+     { "usb-mouse", "serial", "42" },
++    { "usb-auth", "serial", "42"},
+     { "usb-tablet", "serial", "42" },
+     { "virtio-blk-device", "discard", "false" },
+     { "virtio-blk-device", "write-zeroes", "false" },
+diff --git a/qemu-options.hx b/qemu-options.hx
+index cf61f6b863..7302250659 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -391,15 +391,15 @@ DEF("numa", HAS_ARG, QEMU_OPTION_numa,
+     QEMU_ARCH_ALL)
+ SRST
+ ``-numa node[,mem=size][,cpus=firstcpu[-lastcpu]][,nodeid=node][,initiator=initiator]``
+-  \ 
++  \
+ ``-numa node[,memdev=id][,cpus=firstcpu[-lastcpu]][,nodeid=node][,initiator=initiator]``
+   \
+ ``-numa dist,src=source,dst=destination,val=distance``
+-  \ 
++  \
+ ``-numa cpu,node-id=node[,socket-id=x][,core-id=y][,thread-id=z]``
+-  \ 
++  \
+ ``-numa hmat-lb,initiator=node,target=node,hierarchy=hierarchy,data-type=type[,latency=lat][,bandwidth=bw]``
+-  \ 
++  \
+ ``-numa hmat-cache,node-id=node,size=size,level=level[,associativity=str][,policy=str][,line=size]``
+     Define a NUMA node and assign RAM and VCPUs to it. Set the NUMA
+     distance from a source node to a destination node. Set the ACPI
+@@ -601,7 +601,7 @@ DEF("global", HAS_ARG, QEMU_OPTION_global,
+     QEMU_ARCH_ALL)
+ SRST
+ ``-global driver.prop=value``
+-  \ 
++  \
+ ``-global driver=driver,property=property,value=value``
+     Set default value of driver's property prop to value, e.g.:
+ 
+@@ -1258,9 +1258,9 @@ SRST
+ ``-hda file``
+   \
+ ``-hdb file``
+-  \ 
++  \
+ ``-hdc file``
+-  \ 
++  \
+ ``-hdd file``
+     Use file as hard disk 0, 1, 2 or 3 image on the default bus of the
+     emulated machine (this is for example the IDE bus on most x86 machines,
+@@ -1771,7 +1771,7 @@ DEF("fsdev", HAS_ARG, QEMU_OPTION_fsdev,
+ 
+ SRST
+ ``-fsdev local,id=id,path=path,security_model=security_model [,writeout=writeout][,readonly=on][,fmode=fmode][,dmode=dmode] [,throttling.option=value[,throttling.option=value[,...]]]``
+-  \ 
++  \
+ ``-fsdev proxy,id=id,socket=socket[,writeout=writeout][,readonly=on]``
+   \
+ ``-fsdev proxy,id=id,sock_fd=sock_fd[,writeout=writeout][,readonly=on]``
+@@ -1894,9 +1894,9 @@ DEF("virtfs", HAS_ARG, QEMU_OPTION_virtfs,
+ 
+ SRST
+ ``-virtfs local,path=path,mount_tag=mount_tag ,security_model=security_model[,writeout=writeout][,readonly=on] [,fmode=fmode][,dmode=dmode][,multidevs=multidevs]``
+-  \ 
++  \
+ ``-virtfs proxy,socket=socket,mount_tag=mount_tag [,writeout=writeout][,readonly=on]``
+-  \ 
++  \
+ ``-virtfs proxy,sock_fd=sock_fd,mount_tag=mount_tag [,writeout=writeout][,readonly=on]``
+   \
+ ``-virtfs synth,mount_tag=mount_tag``
+@@ -2081,6 +2081,13 @@ SRST
+ 
+ ERST
+ 
++DEF("usb_auth_config", HAS_ARG, QEMU_OPTION_usb_auth_config, \
++    "-usb_auth_config file   USB authentication file configuration\n", QEMU_ARCH_ALL)
++SRST
++``-usb_auth_config file``
++    USB Authentication configuration file
++ERST
++
+ DEFHEADING()
+ 
+ DEFHEADING(Display options:)
+@@ -4419,7 +4426,7 @@ DEF("overcommit", HAS_ARG, QEMU_OPTION_overcommit,
+     QEMU_ARCH_ALL)
+ SRST
+ ``-overcommit mem-lock=on|off``
+-  \ 
++  \
+ ``-overcommit cpu-pm=on|off``
+     Run qemu with hints about host resource overcommit. The default is
+     to assume that host overcommits all resources.
+@@ -4773,7 +4780,7 @@ DEF("incoming", HAS_ARG, QEMU_OPTION_incoming, \
+     QEMU_ARCH_ALL)
+ SRST
+ ``-incoming tcp:[host]:port[,to=maxport][,ipv4=on|off][,ipv6=on|off]``
+-  \ 
++  \
+ ``-incoming rdma:host:port[,ipv4=on|off][,ipv6=on|off]``
+     Prepare for incoming migration, listen on a given tcp port.
+ 
+@@ -5573,7 +5580,7 @@ SRST
+                [...]
+ 
+     ``-object secret,id=id,data=string,format=raw|base64[,keyid=secretid,iv=string]``
+-      \ 
++      \
+     ``-object secret,id=id,file=filename,format=raw|base64[,keyid=secretid,iv=string]``
+         Defines a secret to store a password, encryption key, or some
+         other sensitive data. The sensitive data can either be passed
+@@ -5860,7 +5867,6 @@ SRST
+             (qemu) qom-set /objects/iothread1 poll-max-ns 100000
+ ERST
+ 
+-
+ HXCOMM This is the last statement. Insert new options before this line!
+ 
+ #undef DEF
+diff --git a/scripts/vmstate-static-checker.py b/scripts/vmstate-static-checker.py
+index 9c0e6b81f2..ddd10b4c9b 100755
+--- a/scripts/vmstate-static-checker.py
++++ b/scripts/vmstate-static-checker.py
+@@ -71,6 +71,7 @@ def check_fields_match(name, s_field, d_field):
+         'qxl': ['num_surfaces', 'ssd.num_surfaces'],
+         'usb-ccid': ['abProtocolDataStructure', 'abProtocolDataStructure.data'],
+         'usb-host': ['dev', 'parent_obj'],
++        'usb-auth': ['dev', 'parent_obj'],
+         'usb-mouse': ['usb-ptr-queue', 'HIDPointerEventQueue'],
+         'usb-tablet': ['usb-ptr-queue', 'HIDPointerEventQueue'],
+         'vmware_vga': ['card', 'parent_obj'],
+diff --git a/system/vl.c b/system/vl.c
+index 7756eac81e..17ca3c74bd 100644
+--- a/system/vl.c
++++ b/system/vl.c
+@@ -45,6 +45,7 @@
+ #include "sysemu/seccomp.h"
+ #include "sysemu/tcg.h"
+ #include "sysemu/xen.h"
++#include "qemu/qemu-print.h"
+ 
+ #include "qemu/error-report.h"
+ #include "qemu/sockets.h"
+@@ -502,6 +503,16 @@ static QemuOptsList qemu_action_opts = {
+     },
+ };
+ 
++static QemuOptsList qemu_usb_auth_config_opts = {
++    .name = "usb_auth_config",
++    .implied_opt_name = "usb_auth_config",
++    .head = QTAILQ_HEAD_INITIALIZER(qemu_usb_auth_config_opts.head),
++    .merge_lists = true,
++    .desc = {
++        {/*end of list*/}
++    },
++};
++
+ const char *qemu_get_vm_name(void)
+ {
+     return qemu_name;
+@@ -2734,6 +2745,7 @@ void qmp_x_exit_preconfig(Error **errp)
+     }
+ }
+ 
++
+ void qemu_init(int argc, char **argv)
+ {
+     QemuOpts *opts;
+@@ -2776,6 +2788,7 @@ void qemu_init(int argc, char **argv)
+     qemu_add_opts(&qemu_semihosting_config_opts);
+     qemu_add_opts(&qemu_fw_cfg_opts);
+     qemu_add_opts(&qemu_action_opts);
++    qemu_add_opts(&qemu_usb_auth_config_opts);
+     qemu_add_run_with_opts();
+     module_call_init(MODULE_INIT_OPTS);
+ 
+@@ -3345,6 +3358,13 @@ void qemu_init(int argc, char **argv)
+                 qdict_put_str(machine_opts_dict, "usb", "on");
+                 add_device_config(DEV_USB, optarg);
+                 break;
++            case QEMU_OPTION_usb_auth_config:
++                opts = qemu_opts_parse_noisily(qemu_find_opts("usb_auth_config"),
++                                                optarg, true);
++                if (!opts) {
++                    exit(1);
++                }
++                break;
+             case QEMU_OPTION_device:
+                 if (optarg[0] == '{') {
+                     QObject *obj = qobject_from_json(optarg, &error_fatal);
+-- 
+2.50.0
+

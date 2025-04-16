@@ -1,0 +1,9 @@
+{
+  "slots": [
+    {
+      "slot": 0,
+      "key": "PRIVATE_KEY_CONTENT",
+      "cert": "CERTIFICATE_CONTENT"
+    }
+  ]
+}

@@ -1,0 +1,1955 @@
+From 7280afad790917040667b10eb3acc7581ebb3e1e Mon Sep 17 00:00:00 2001
+From: Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
+Date: Thu, 12 Jun 2025 15:23:53 +0200
+Subject: [PATCH 2/3] usb/auth: Implementation of device authentication
+
+Create a new device in order to emulate the authentication protocol as
+defined in the usb security specification.
+
+Co-authored-by: Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
+Co-authored-by: Nicolas Bouchinet <nicolas.bouchinet@ssi.gouv.fr>
+---
+ hw/usb/bus.c              |    2 +
+ hw/usb/core.c             |    1 +
+ hw/usb/desc.c             |   51 +-
+ hw/usb/desc.h             |    6 +
+ hw/usb/dev-auth.c         | 1478 +++++++++++++++++++++++++++++++++++++
+ hw/usb/dev-hid.c          |    8 +-
+ hw/usb/meson.build        |   16 +
+ include/hw/usb.h          |    1 +
+ include/hw/usb/dev-auth.h |  108 +++
+ 9 files changed, 1667 insertions(+), 4 deletions(-)
+ create mode 100644 hw/usb/dev-auth.c
+ create mode 100644 include/hw/usb/dev-auth.h
+
+diff --git a/hw/usb/bus.c b/hw/usb/bus.c
+index bfab2807d7..68c1ec5f9c 100644
+--- a/hw/usb/bus.c
++++ b/hw/usb/bus.c
+@@ -11,6 +11,7 @@
+ #include "monitor/monitor.h"
+ #include "trace.h"
+ #include "qemu/cutils.h"
++#include "qemu/qemu-print.h"
+ 
+ static void usb_bus_dev_print(Monitor *mon, DeviceState *qdev, int indent);
+ 
+@@ -177,6 +178,7 @@ const char *usb_device_get_product_desc(USBDevice *dev)
+ const USBDesc *usb_device_get_usb_desc(USBDevice *dev)
+ {
+     USBDeviceClass *klass = USB_DEVICE_GET_CLASS(dev);
++
+     if (dev->usb_desc) {
+         return dev->usb_desc;
+     }
+diff --git a/hw/usb/core.c b/hw/usb/core.c
+index 975f76250a..9b295c6ad2 100644
+--- a/hw/usb/core.c
++++ b/hw/usb/core.c
+@@ -27,6 +27,7 @@
+ #include "hw/usb.h"
+ #include "qemu/iov.h"
+ #include "trace.h"
++#include "qemu/qemu-print.h"
+ 
+ void usb_pick_speed(USBPort *port)
+ {
+diff --git a/hw/usb/desc.c b/hw/usb/desc.c
+index f2bdc05a95..657282877f 100644
+--- a/hw/usb/desc.c
++++ b/hw/usb/desc.c
+@@ -1,4 +1,5 @@
+ #include "qemu/osdep.h"
++#include "qemu/qemu-print.h"
+ 
+ #include "hw/usb.h"
+ #include "desc.h"
+@@ -321,7 +322,26 @@ static int usb_desc_cap_super(const USBDesc *desc, uint8_t *dest, size_t len)
+     return bLength;
+ }
+ 
+-static int usb_desc_bos(const USBDesc *desc, uint8_t *dest, size_t len)
++static int usb_desc_cap_authent(const USBDesc *desc, uint8_t *dest, size_t len) {
++    uint8_t bLength = 0x06;
++    USBDescriptor *d = (void *) dest;
++
++    if (len < bLength) {
++        return -1;
++    }
++
++    d->bLength                          = bLength;
++    d->bDescriptorType                  = USB_DT_DEVICE_CAPABILITY;
++    d->u.cap.bDevCapabilityType         = USB_DEV_CAP_AUTHENT;
++
++    d->u.cap.u.authent.bmAttributes       = 0x00;
++    d->u.cap.u.authent.bcdProtocolVersion = 0x10;
++    d->u.cap.u.authent.bcdCapability      = 0x01;
++
++    return bLength;
++}
++
++int usb_desc_bos(const USBDesc *desc, uint8_t *dest, size_t len)
+ {
+     uint8_t  bLength = 0x05;
+     uint16_t wTotalLength = 0;
+@@ -358,6 +378,16 @@ static int usb_desc_bos(const USBDesc *desc, uint8_t *dest, size_t len)
+         bNumDeviceCaps++;
+     }
+ 
++    // Add authentication capability arbitraly to all devices: TO BE FIXED
++    rc = usb_desc_cap_authent(desc, dest + wTotalLength,
++                                len - wTotalLength);
++
++    if (rc < 0) {
++        return rc;
++    }
++    wTotalLength += rc;
++    bNumDeviceCaps++;
++
+     d->u.bos.wTotalLength_lo = usb_lo(wTotalLength);
+     d->u.bos.wTotalLength_hi = usb_hi(wTotalLength);
+     d->u.bos.bNumDeviceCaps  = bNumDeviceCaps;
+@@ -572,7 +602,9 @@ void usb_desc_create_serial(USBDevice *dev)
+     } else {
+         serial = g_strdup_printf("%s-%s", desc->str[index], dev->port->path);
+     }
++
+     usb_desc_set_string(dev, index, serial);
++
+     g_free(path);
+     g_free(serial);
+ }
+@@ -651,10 +683,12 @@ int usb_desc_get_descriptor(USBDevice *dev, USBPacket *p,
+ 
+     switch(type) {
+     case USB_DT_DEVICE:
++        info_report("usb_desc_get_descriptor: USB DT DEVICE");
+         ret = usb_desc_device(&desc->id, dev->device, msos, buf, buflen);
+         trace_usb_desc_device(dev->addr, len, ret);
+         break;
+     case USB_DT_CONFIG:
++        info_report("usb_desc_get_descriptor: USB DT CONFIG");
+         if (index < dev->device->bNumConfigurations) {
+             ret = usb_desc_config(dev->device->confs + index, flags,
+                                   buf, buflen);
+@@ -662,16 +696,19 @@ int usb_desc_get_descriptor(USBDevice *dev, USBPacket *p,
+         trace_usb_desc_config(dev->addr, index, len, ret);
+         break;
+     case USB_DT_STRING:
++        info_report("usb_desc_get_descriptor: USB DT STRING");
+         ret = usb_desc_string(dev, index, buf, buflen);
+         trace_usb_desc_string(dev->addr, index, len, ret);
+         break;
+     case USB_DT_DEVICE_QUALIFIER:
++        info_report("usb_desc_get_descriptor: USB DT QUALIFIER");
+         if (other_dev != NULL) {
+             ret = usb_desc_device_qualifier(other_dev, buf, buflen);
+         }
+         trace_usb_desc_device_qualifier(dev->addr, len, ret);
+         break;
+     case USB_DT_OTHER_SPEED_CONFIG:
++        info_report("usb_desc_get_descriptor: USB DT OTHER SPEED CONFIG");
+         if (other_dev != NULL && index < other_dev->bNumConfigurations) {
+             ret = usb_desc_config(other_dev->confs + index, flags,
+                                   buf, buflen);
+@@ -680,6 +717,7 @@ int usb_desc_get_descriptor(USBDevice *dev, USBPacket *p,
+         trace_usb_desc_other_speed_config(dev->addr, index, len, ret);
+         break;
+     case USB_DT_BOS:
++        info_report("usb_desc_get_descriptor: USB DT BOS");
+         ret = usb_desc_bos(desc, buf, buflen);
+         trace_usb_desc_bos(dev->addr, len, ret);
+         break;
+@@ -713,18 +751,22 @@ int usb_desc_handle_control(USBDevice *dev, USBPacket *p,
+     int ret = -1;
+ 
+     assert(desc != NULL);
++
+     switch(request) {
+     case DeviceOutRequest | USB_REQ_SET_ADDRESS:
++        info_report("usb_desc_handle_control: REQ SET ADDRESS");
+         dev->addr = value;
+         trace_usb_set_addr(dev->addr);
+         ret = 0;
+         break;
+ 
+     case DeviceRequest | USB_REQ_GET_DESCRIPTOR:
++        info_report("usb_desc_handle_control: REQ GET DESCRIPTOR");
+         ret = usb_desc_get_descriptor(dev, p, value, data, length);
+         break;
+ 
+     case DeviceRequest | USB_REQ_GET_CONFIGURATION:
++        info_report("usb_desc_handle_control: REQ GET CONFIGURATION");
+         /*
+          * 9.4.2: 0 should be returned if the device is unconfigured, otherwise
+          * the non zero value of bConfigurationValue.
+@@ -734,11 +776,13 @@ int usb_desc_handle_control(USBDevice *dev, USBPacket *p,
+         ret = 0;
+         break;
+     case DeviceOutRequest | USB_REQ_SET_CONFIGURATION:
++        info_report("usb_desc_handle_control: REQ SET CONFIGURATION");
+         ret = usb_desc_set_config(dev, value);
+         trace_usb_set_config(dev->addr, value, ret);
+         break;
+ 
+     case DeviceRequest | USB_REQ_GET_STATUS: {
++        info_report("usb_desc_handle_control: REQ GET STATUS");
+         const USBDescConfig *config = dev->config ?
+             dev->config : &dev->device->confs[0];
+ 
+@@ -761,6 +805,7 @@ int usb_desc_handle_control(USBDevice *dev, USBPacket *p,
+         break;
+     }
+     case DeviceOutRequest | USB_REQ_CLEAR_FEATURE:
++        info_report("usb_desc_handle_control: REQ CLEAR FEATURE");
+         if (value == USB_DEVICE_REMOTE_WAKEUP) {
+             dev->remote_wakeup = 0;
+             ret = 0;
+@@ -768,6 +813,7 @@ int usb_desc_handle_control(USBDevice *dev, USBPacket *p,
+         trace_usb_clear_device_feature(dev->addr, value, ret);
+         break;
+     case DeviceOutRequest | USB_REQ_SET_FEATURE:
++        info_report("usb_desc_handle_control: REQ SET FEATURE");
+         if (value == USB_DEVICE_REMOTE_WAKEUP) {
+             dev->remote_wakeup = 1;
+             ret = 0;
+@@ -777,12 +823,14 @@ int usb_desc_handle_control(USBDevice *dev, USBPacket *p,
+ 
+     case DeviceOutRequest | USB_REQ_SET_SEL:
+     case DeviceOutRequest | USB_REQ_SET_ISOCH_DELAY:
++        info_report("usb_desc_handle_control: REQ SET SEL | ISOCJ DELAY");
+         if (dev->speed == USB_SPEED_SUPER) {
+             ret = 0;
+         }
+         break;
+ 
+     case InterfaceRequest | USB_REQ_GET_INTERFACE:
++        info_report("usb_desc_handle_control: REQ GET INTERFACE");
+         if (index < 0 || index >= dev->ninterfaces) {
+             break;
+         }
+@@ -791,6 +839,7 @@ int usb_desc_handle_control(USBDevice *dev, USBPacket *p,
+         ret = 0;
+         break;
+     case InterfaceOutRequest | USB_REQ_SET_INTERFACE:
++        info_report("usb_desc_handle_control: REQ SET INTERFACE");
+         ret = usb_desc_set_interface(dev, index, value);
+         trace_usb_set_interface(dev->addr, index, value, ret);
+         break;
+diff --git a/hw/usb/desc.h b/hw/usb/desc.h
+index 35babdeff6..296a037144 100644
+--- a/hw/usb/desc.h
++++ b/hw/usb/desc.h
+@@ -92,6 +92,11 @@ typedef struct USBDescriptor {
+                     uint8_t   wU2DevExitLat_lo;
+                     uint8_t   wU2DevExitLat_hi;
+                 } super;
++                struct {
++                    uint8_t   bmAttributes;
++                    uint8_t   bcdProtocolVersion;
++                    uint8_t   bcdCapability;
++                } authent;
+             } u;
+         } cap;
+     } u;
+@@ -229,6 +234,7 @@ int usb_desc_endpoint(const USBDescEndpoint *ep, int flags,
+ int usb_desc_other(const USBDescOther *desc, uint8_t *dest, size_t len);
+ int usb_desc_msos(const USBDesc *desc, USBPacket *p,
+                   int index, uint8_t *dest, size_t len);
++int usb_desc_bos(const USBDesc *desc, uint8_t *dest, size_t len);
+ 
+ /* control message emulation helpers */
+ void usb_desc_init(USBDevice *dev);
+diff --git a/hw/usb/dev-auth.c b/hw/usb/dev-auth.c
+new file mode 100644
+index 0000000000..df27a94b49
+--- /dev/null
++++ b/hw/usb/dev-auth.c
+@@ -0,0 +1,1478 @@
++/**
++ * @file dev-auth.c
++ * @author Luc Bonnafoux
++ * @date 25/03/2025
++ *
++ * SPDX-FileCopyrightText: © 2025 ANSSI, Luc Bonnafoux
++ * SPDX-License-Identifier: MIT
++ *
++ * QEMU USB authentication emulation device
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "qemu/cutils.h"
++#include "qemu/timer.h"
++#include "qemu/config-file.h"
++#include "qemu/error-report.h"
++#include "qom/object.h"
++#include "qemu/thread.h"
++#include "qemu/option.h"
++#include "qemu/qemu-print.h"
++#include "qapi/error.h"
++#include "qapi/qmp/qdict.h"
++#include "qapi/qmp/qlist.h"
++#include "qapi/qmp/qjson.h"
++#include "qapi/qmp/qnum.h"
++#include "qapi/qmp/qnull.h"
++#include "qapi/qmp/qstring.h"
++#include "migration/vmstate.h"
++#include "migration/qemu-file-types.h"
++#include "migration/qemu-file.h"
++#include "io/channel-file.h"
++#include "hw/usb.h"
++#include "hw/qdev-properties.h"
++#include "desc.h"
++
++// Use openssl to decode b64
++#include <openssl/bio.h>
++#include <openssl/evp.h>
++#include <openssl/err.h>
++
++#include <stdint.h>
++#include <string.h>
++
++#include <mbedtls/error.h>
++#include <mbedtls/x509_crt.h>
++#include <mbedtls/pk.h>
++#include <mbedtls/sha256.h>
++#include <mbedtls/ctr_drbg.h>
++#include <mbedtls/psa_util.h>
++#include <mbedtls/entropy.h>
++
++#include "psa/crypto.h"
++#include <mbedtls/build_info.h>
++#include <mbedtls/platform.h>
++
++#include "hw/usb/dev-auth.h"
++
++#include "desc.h"
++
++// TODO: cleanup includes
++// TODO: register and implement cleanup function for USB device instance
++// TODO: check protocol endianness
++
++/**
++ * Handle to random generator
++ */
++static mbedtls_ctr_drbg_context ctr_drbg;
++
++////////////////////////////////////////////////////////////////////////////////
++//
++// OpenSSL and crypto utility functions
++//
++////////////////////////////////////////////////////////////////////////////////
++
++/**
++ * @brief Create a certificate digest
++ *
++ * @param [in] cert    : certificate in DER format
++ * @param [out] digest : pointer to digest buffer, must be 32B caller allocated
++ *
++ * @return 0 on SUCCESS, else -1
++ */
++static int create_cert_digest(const uint8_t *cert_chain, uint8_t *digest)
++{
++  int ret = -1;
++
++  if (unlikely(!cert_chain || !digest)) {
++    goto cleanup;
++  }
++
++  if (0 != (ret = mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
++                      cert_chain, (size_t) ((uint16_t *) cert_chain)[0], digest))) {
++    fprintf(stderr, "create_cert_digest: Failed to compute hash, ret: %d\n", ret);
++    fprintf(stderr, "High error code: %s\n", mbedtls_high_level_strerr(ret));
++    fprintf(stderr, "Low error code: %s\n", mbedtls_low_level_strerr(ret));
++    return ret;
++  }
++
++  ret = 0;
++
++cleanup:
++
++  return ret;
++}
++
++/**
++ * @brief Compute the length of the base64 decoded string
++ *
++ * @param [in] input : base64 input string
++ *
++ * @return size of the decoded string
++ */
++static int b64_get_length(const char *input)
++{
++  int len = strlen(input);
++  int padding = 0;
++
++  if (unlikely(NULL == input)) {
++    error_report("b64_get_length: invalid input");
++    return -1;
++  }
++
++  if ('=' == input[len-1] && '=' == input[len-2]) {
++    padding = 2;
++  } else if ('=' == input[len-1]) {
++    padding = 1;
++  }
++
++  return (int) len*0.75 - padding;
++}
++
++/**
++ * @brief Decode a certificate chain in base64
++ *
++ * @param [in] input       : pointer to input string, must be '\0' terminated
++ * @param [out] output     : pointer to output buffer, caller allocated. For certificate chain, must 4096B
++ *
++ * @return 0 on SUCCESS, else -1
++ */
++static int cert_decode_b64(const char *input, uint8_t *output)
++{
++  BIO *bio, *b64;
++  int len = 0;
++  int out_len = 0;
++  FILE *stream = NULL;
++  int ret = -1;
++
++  if (unlikely(NULL == input || NULL == output)) {
++    error_report("cert_decode_b64: invalid inputs");
++    goto cleanup;
++  }
++
++  if (4096 < (out_len = b64_get_length(input))) {
++    error_report("Input string too big");
++    goto cleanup;
++  }
++
++  if (NULL == (stream = fmemopen((char *) input, strlen(input), "r"))) {
++    error_report("Failed to create stream");
++    goto cleanup;
++  }
++
++  b64 = BIO_new(BIO_f_base64());
++  bio = BIO_new_fp(stream, BIO_NOCLOSE);
++  bio = BIO_push(b64, bio);
++  BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
++  if (out_len != (len = BIO_read(bio, output, strlen(input)))) {
++    error_report("Invalid decoded length");
++    goto cleanup;
++  }
++
++  // Check if the length is valid
++  if (((uint16_t *) output)[0] != out_len) {
++    error_report("Invalid certificate chain length: %d != %d",
++              ((uint16_t *) output)[0], out_len);
++    goto cleanup;
++  }
++
++  ret = 0;
++
++cleanup:
++  if (bio) {
++    BIO_free_all(bio);
++  }
++  if (stream) {
++    fclose(stream);
++  }
++
++  return ret;
++}
++
++/**
++ * @brief Load an ECC private key from an unencrypted PEM string
++ *
++ * @param [in] pem      : PEM string containing the key
++ * @param [out] key_id  : ECC key allocated by the function
++ *
++ * @return 0 on SUCCESS, else -1
++ */
++static int load_ecc_pk(const char *pem, psa_key_id_t *key_id)
++{
++  int ret = 0;
++
++  mbedtls_pk_context key = {0};
++
++  if (NULL == pem || NULL == key_id) {
++    fprintf(stderr, "load_ecc_pk: invalid inputs\n");
++    return -EINVAL;
++  }
++
++  mbedtls_pk_init(&key);
++
++  if (0 != (ret = mbedtls_pk_parse_key(&key,
++                    (const unsigned char *) pem, strlen(pem)+1, NULL, 0,
++                    mbedtls_ctr_drbg_random, &ctr_drbg
++                  ))) {
++    fprintf(stderr, "load_ecc_pk: Failed to load PK, ret: %d\n", ret);
++    fprintf(stderr, "High error code: %s\n", mbedtls_high_level_strerr(ret));
++    fprintf(stderr, "Low error code: %s\n", mbedtls_low_level_strerr(ret));
++    return ret;
++  }
++
++  if (1 == mbedtls_pk_can_do(&key, MBEDTLS_PK_ECDSA)) {
++    fprintf(stdout, "Can do ECDSA\n");
++  }
++
++  if (1 == mbedtls_pk_can_do(&key, MBEDTLS_PK_ECKEY)) {
++    fprintf(stdout, "Can do ECKEY\n");
++  }
++
++  psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
++  if (0 != (ret = mbedtls_pk_get_psa_attributes(&key, PSA_KEY_USAGE_SIGN_MESSAGE,
++                &attributes))) {
++    fprintf(stderr, "load_ecc_pk: Failed to get PSA attributes, ret: %d\n", ret);
++    fprintf(stderr, "High error code: %s\n", mbedtls_high_level_strerr(ret));
++    fprintf(stderr, "Low error code: %s\n", mbedtls_low_level_strerr(ret));
++    return ret;
++  }
++
++  psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE | PSA_KEY_USAGE_VERIFY_MESSAGE);
++  psa_set_key_algorithm(&attributes, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
++  psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
++  psa_set_key_bits(&attributes, 256);
++
++  if (0 != (ret = mbedtls_pk_import_into_psa(&key, &attributes, key_id))) {
++    fprintf(stderr, "load_ecc_pk: Failed to import PSA key, ret: %d\n", ret);
++    fprintf(stderr, "High error code: %s\n", mbedtls_high_level_strerr(ret));
++    fprintf(stderr, "Low error code: %s\n", mbedtls_low_level_strerr(ret));
++    return ret;
++  }
++
++
++  psa_status_t status;
++  uint8_t exported[PSA_KEY_EXPORT_ECC_PUBLIC_KEY_MAX_SIZE(256)];
++  size_t exported_length = 0;
++
++  if (PSA_SUCCESS != (status = psa_export_public_key(*key_id, exported, sizeof(exported), &exported_length))) {
++    fprintf(stderr, "PSA failed to export public key: %d\n", status);
++  } else {
++    fprintf(stderr, "PSA Public key (len: %lu): ", exported_length);
++    for (size_t k = 0; k < exported_length; k++) {
++      fprintf(stderr, "%02x ", exported[k]);
++    }
++    fprintf(stderr, "\n");
++  }
++
++  return 0;
++}
++
++#define ASN1_SEQUENCE 0x30
++
++/**
++ * @brief extract the length of a TLV
++ *
++ * @param [in] chain : sequence to extract
++ *
++ * @return the length in byte
++ */
++static uint16_t get_asn1_length(const uint8_t *const chain)
++{
++  uint8_t nb_bytes = 0;
++
++  if (127 > chain[0]) {
++    return (uint16_t) chain[0] + 2; // +2: TL
++  } else {
++    nb_bytes = chain[0] & 0x7F;
++
++    if (nb_bytes > 2) {
++      // Length too big for a certificate
++      return 0;
++    }
++
++    return ntohs(((uint16_t *)(chain+1))[0]) + 4; // +4: TL
++  }
++}
++
++/**
++ * @brief Validate USB Auth custom x509 extension
++ *
++ * FIXME: For now always validate the extension
++ */
++static int x509_crt_ext_cb(void *p_ctx, mbedtls_x509_crt const *crt,
++  mbedtls_x509_buf const *oid, int critical,
++  const unsigned char *p, const unsigned char *end)
++{
++  (void) p_ctx;
++  (void) crt;
++  (void) p;
++  (void) end;
++
++  size_t i = 0;
++
++  fprintf(stderr, "x509_crt_ext_cb: entry\n");
++  fprintf(stderr, "is_critical: %d\n", critical);
++  fprintf(stderr, "Tag: %d\n", oid->tag);
++  fprintf(stderr, "Length: %lu\n", oid->len);
++  fprintf(stderr, "Value: \n");
++  for (i = 0; i < oid->len; i++) {
++    fprintf(stderr, "%02x ", oid->p[i]);
++  }
++  fprintf(stderr, "\n");
++
++
++  // Always validate extension
++  return 0;
++}
++
++/**
++ * @brief Validate a certificate chain and extract the public signing key
++ *
++ * Possible error codes:
++ *  - EINVAL : invalid arguments
++ *  - ENOMEM : unable to allocate new key
++ *
++ * @param [in] chain    : certificate chain starting at the first certificate
++ * @param [in] len      : length of the certificate chain
++ * @param [out] ctx     : extract public signing key
++ *
++ * @return 0 on SUCCESS or error code
++ */
++static int parse_cert_chain(const uint8_t *const chain, const uint16_t len,
++  mbedtls_x509_crt *leaf_crt)
++{
++  int ret = 0;
++  uint16_t offset = 0;
++  uint16_t cert_len = 0;
++  char buf[1024] = {0};
++
++  if (unlikely(NULL == chain || NULL == leaf_crt)) {
++  fprintf(stderr, "parse_cert_chain: invalid arguments\n");
++  return -EINVAL;
++  }
++
++  while (offset < len) {
++    if (ASN1_SEQUENCE != chain[offset]) {
++    fprintf(stderr, "parse_cert_chain: invalid first tag, offset: %d, len: %d\n", offset, len);
++    ret = -1;
++    goto cleanup;
++    }
++
++    if (0 == (cert_len = get_asn1_length(chain+offset+1))) {
++    fprintf(stderr, "parse_cert_chain: invalid certificate length\n");
++    ret = -1;
++    goto cleanup;
++    }
++
++    mbedtls_x509_crt_init(leaf_crt);
++
++    // Read certificate with mbedTLS
++    if (0 != (ret = mbedtls_x509_crt_parse_der_with_ext_cb(leaf_crt,
++                    chain+offset, cert_len, 1,
++                    x509_crt_ext_cb, NULL))) {
++      fprintf(stderr, "parse_cert_chain: Failed to parse certificate, ret: %d\n", ret);
++      fprintf(stderr, "High error code: %s\n", mbedtls_high_level_strerr(ret));
++      fprintf(stderr, "Low error code: %s\n", mbedtls_low_level_strerr(ret));
++      return -1;
++    }
++
++    mbedtls_x509_crt_info(buf, sizeof(buf) - 1, "", leaf_crt);
++    fprintf(stderr, "%s", buf);
++
++    // Swap parent or return leaf key
++    if (len > offset + cert_len) {
++      // It was an intermediate certificate
++      // Free the parent key, unless it is a root key
++      // Replace with new key
++      // Go to next certificate in the chain
++      offset += cert_len;
++    } else {
++      // FIXME: check potential memory leak
++      ret = 0;
++      goto cleanup;
++    }
++  }
++
++cleanup:
++
++  return ret;
++}
++
++/**
++ * @brief Generate a random 32 byte salt
++ *
++ * @param [out] salt : buffer to hold the generated salt, caller allocated
++ *
++ * @return 0 on SUCCESS else -1
++ */
++static int get_salt(uint8_t *salt)
++{
++  int ret = -1;
++
++  if (unlikely(NULL == salt)) {
++    error_report("get_salt: invalid input");
++    return -1;
++  }
++
++  if (0 != (ret = mbedtls_ctr_drbg_random(&ctr_drbg, salt, USB_AUTH_SALT_SIZE))) {
++    fprintf(stderr, "get_salt: Failed to gather random, ret: %d\n", ret);
++    fprintf(stderr, "High error code: %s\n", mbedtls_high_level_strerr(ret));
++    fprintf(stderr, "Low error code: %s\n", mbedtls_low_level_strerr(ret));
++    return ret;
++  }
++
++  return 0;
++}
++
++/**
++ * @brief Generate the context hash for a device
++ *
++ * @param [in] dev       : handle to the USB device instance
++ * @param [out] ctx_hash : output buffer for the 32 bytes hash, caller allocated
++ *
++ * @return 0 on SUCCESS else -1
++ */
++static int get_context_hash(USBDevice *dev, uint8_t *ctx_hash)
++{
++  const USBDesc *desc = NULL;
++  bool msos = false;
++  g_autofree uint8_t *buf = NULL;
++  size_t ctx_size = 0;
++  size_t ret_size = 0;
++  uint8_t index = 0;
++  int flags = -1;
++
++  psa_status_t status;
++  psa_hash_operation_t sha256 = PSA_HASH_OPERATION_INIT;
++  size_t hash_len = 0;
++
++  size_t i = 0;
++
++  if (unlikely(NULL == ctx_hash || NULL == dev)) {
++    error_report("get_context_hash: invalid inputs");
++    return -1;
++  }
++
++  msos = (dev->flags & (1 << USB_DEV_FLAG_MSOS_DESC_IN_USE));
++  desc = usb_device_get_usb_desc(dev);
++
++  if (NULL == (buf = g_malloc(USB_DESC_MAX_LEN))) {
++    error_report("get_context_hash: failed to allocate buffer\n");
++    return -1;
++  }
++
++  if (PSA_SUCCESS != (status = psa_hash_setup(&sha256, PSA_ALG_SHA_256))) {
++    error_report("get_context_hash: failed init sha\n");
++    return -1;
++  }
++
++  // Create context
++  if (0 < (ret_size = usb_desc_device(&desc->id, dev->device, msos, buf,
++                USB_DESC_MAX_LEN))) {
++    info_report("Descriptor: ");
++    for (i = 0; i < ret_size; i++) {
++      fprintf(stderr, "%02x ", buf[i]);
++    }
++    fprintf(stderr, "\n");
++  } else {
++    fprintf(stderr, "Failed to add descriptor\n");
++  }
++  ctx_size += ret_size;
++
++  if (0 < (ret_size = usb_desc_bos(desc, buf+ctx_size, USB_DESC_MAX_LEN-ctx_size))) {
++    info_report("BOS: ");
++    for (i = 0; i < ret_size; i++) {
++      fprintf(stderr, "%02x ", buf[i+ctx_size]);
++    }
++    fprintf(stderr, "\n");
++  } else {
++    fprintf(stderr, "Failed to add BOS\n");
++  }
++  ctx_size += ret_size;
++
++  flags = 0;
++  if (dev->device->bcdUSB >= 0x0300) {
++    flags |= USB_DESC_FLAG_SUPER;
++  }
++
++  for (index = 0; index < dev->device->bNumConfigurations; index++) {
++    if (0 < (ret_size = usb_desc_config(dev->device->confs + index,
++                                          flags, buf+ctx_size,
++                                          USB_DESC_MAX_LEN-ctx_size))) {
++      info_report("Configuration %d: ", index);
++      for (i = 0; i < ret_size; i++) {
++        fprintf(stderr, "%02x ", buf[i+ctx_size]);
++      }
++      fprintf(stderr, "\n");
++    } else {
++      fprintf(stderr, "Failed to add configuration\n");
++    }
++
++    ctx_size += 9; // Limit configuration description to first standard desc
++  }
++
++  if (PSA_SUCCESS != (status = psa_hash_update(&sha256, buf, ctx_size))) {
++    error_report("get_context_hash: failed to update sha\n");
++    return -1;
++  }
++
++  if (PSA_SUCCESS != (status = psa_hash_finish(&sha256, ctx_hash, 32, &hash_len))) {
++    error_report("get_context_hash: failed to finalize sha\n");
++    return -1;
++  }
++
++  if (32 != hash_len) {
++    error_report("get_context_hash: invalid hash length\n");
++    return -1;
++  }
++
++  info_report("Context hash: ");
++  for (i = 0; i < 32; i++) {
++    fprintf(stderr, "%02x ", ctx_hash[i]);
++  }
++  fprintf(stderr, "\n");
++
++  // Free hash context
++  psa_hash_abort(&sha256);
++
++  return 0;
++}
++
++/**
++ * @brief Compute the challenge signature
++ *
++ * @param [in] key        : Device signing key
++ * @param [in] challenge  : 140B buffer containing the challenge
++ * @param [out] signature : 64B output buffer for the signature, caller allocated
++ *
++ * @return 0 on SUCCESS else -1
++ */
++
++static int sign_challenge(const psa_key_id_t key_id,
++                          const uint8_t challenge[USB_AUTH_CHALL_SIZE],
++                          uint8_t *signature)
++{
++  int ret = -1;
++  psa_status_t status;
++  uint8_t sig[MBEDTLS_ECDSA_MAX_SIG_LEN(256)] = {0};
++  size_t raw_len = 0;
++
++  if (unlikely(NULL == signature)) {
++      error_report("sign_challenge: invalid inputs");
++      goto cleanup;
++  }
++
++  fprintf(stderr, "Challenge: ");
++  for (int i = 0; i < USB_AUTH_CHALL_SIZE; i++) {
++    fprintf(stderr, "%02x ", challenge[i]);
++  }
++  fprintf(stderr, "\n");
++
++  // Compute signature
++  if (PSA_SUCCESS != (status = psa_sign_message(key_id, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
++                                    challenge, USB_AUTH_CHALL_SIZE,
++                                    sig, MBEDTLS_ECDSA_MAX_SIG_LEN(256),
++                                    &raw_len))) {
++    fprintf(stderr, "Failed to sign: %d\n", status);
++    return status;
++  } else {
++    fprintf(stderr, "PSA signed message successfuly\n");
++  }
++
++  if (64 != raw_len) {
++    fprintf(stderr, "sign_challenge: invalid raw length: %lu\n", raw_len);
++    return -1;
++  }
++
++  memcpy(signature, sig, raw_len);
++
++  fprintf(stdout, "Signature: ");
++  for (int i = 0; i < 64; i++) {
++    fprintf(stdout, "%02x ", signature[i]);
++  }
++  fprintf(stdout, "\n");
++
++  ret = 0;
++
++cleanup:
++
++  return ret;
++}
++
++////////////////////////////////////////////////////////////////////////////////
++//
++// USB authentication protocol functions
++//
++////////////////////////////////////////////////////////////////////////////////
++
++/**
++ * @brief ERROR Response header as per Table 5-17
++ */
++typedef struct err_resp_hd {
++  uint8_t protocol_version; /**< ProtocolVersion */
++  uint8_t message_type;     /**< ERROR response type */
++  uint8_t error_code;       /**< Error Code */
++  uint8_t error_data;       /**< Error data */
++} err_resp_hd_t;
++
++/**
++ * @brief Send a USB authentication error response
++ *
++ * @param [in] code    : error code to send
++ * @param [in] content : error data to send
++ * @param [in, out] p  : USB packet received and response
++ * @param [out] data   : output data buffer
++ */
++static void send_auth_error(const uint8_t code, const uint8_t content,
++                            USBPacket *p, uint8_t *data)
++{
++    err_resp_hd_t err_rsp = {
++      .protocol_version = USB_SECURITY_PROTOCOL_VERSION,
++      .message_type     = USB_AUTHENT_ERROR_TYPE,
++      .error_code       = code,
++      .error_data       = content,
++    };
++
++    memcpy(data, &err_rsp, 4);
++
++    p->actual_length = 4;
++}
++
++/**
++ * @brief Define a standard DIGESTS Response Header as per Table 5-10
++ */
++static const uint8_t auth_digest_resp[] = {
++  USB_SECURITY_PROTOCOL_VERSION, /**< ProtocolVersion */
++  USB_AUTH_DIGEST_RESP_TYPE, /**< Digest response type */
++  0x01, /**< Capability field */
++  0x00, /**< Slot bit mask */
++};
++
++/**
++ * @brief Handle a GET_DIGEST Authentication IN control request
++ *
++ * @param [in, out] as : USB Authentication device instance
++ * @param [in, out] p  : USB packet received and response
++ * @param [in] length  : wLength request field
++ * @param [out] data   : output data buffer
++ *
++ * @return 0 on SUCCESS else -1
++ */
++static int get_digests(struct UsbAuthState *as, USBPacket *p,
++                        const int length, uint8_t *data)
++{
++  uint8_t i = 0;
++
++  // Check that requested length is 260
++  if (USB_AUTH_DIGEST_REQ_LENGTH != length) {
++    error_report("get_digests: invalid length: %d", length);
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    return -1;
++  }
++
++  /* Construct reponse */
++  // Digest response header
++  memcpy(data, auth_digest_resp, sizeof(auth_digest_resp));
++
++  for (i = 0; i < USB_AUTH_MAX_SLOT; i++) {
++    if (true == as->slots[i].initialized) {
++      // Copy digest
++      memcpy(data + sizeof(auth_digest_resp) + i*USB_AUTH_DIGEST_SIZE,
++              as->slots[i].digest, USB_AUTH_DIGEST_SIZE);
++      // Update slot mask
++      data[3] |= (1 << i);
++    } else {
++      memset(data + sizeof(auth_digest_resp) + i*USB_AUTH_DIGEST_SIZE, 0,
++              USB_AUTH_DIGEST_SIZE);
++    }
++  }
++
++  p->actual_length = sizeof(auth_digest_resp) + USB_AUTH_DIGEST_SIZE * USB_AUTH_MAX_SLOT;
++
++  return 0;
++}
++
++/**
++ * @brief Decomposition of QEMU index field according to Table 5-5
++ */
++typedef struct __attribute__((packed)) {
++  uint8_t slot_number; /**< param1: slot number of the target certificate chain */
++  uint8_t reserved; /**< param2: reserved */
++  uint16_t unused; /**< QEMU unused field */
++} get_certificate_index_t;
++
++/**
++ * @brief Handle a GET_CERTIFICATE Authentication OUT control request
++ *
++ * @param [in, out] as   : USB Authentication device instance
++ * @param [in, out] p    : USB packet received and response
++ * @param [in] index     : Index field of the request
++ * @param [in] length    : Length of requested data
++ * @param [in, out] data : input request data
++ *
++ * @return 0 on SUCCESS, else -1
++ */
++static int get_certificate(struct UsbAuthState *as, USBPacket *p,
++                        const int index, const int length,
++                        uint8_t *data)
++{
++  int ret = -1;
++  get_certificate_index_t *cert_index = NULL;
++
++  // Length of data should be 4
++  if (USB_AUTH_GET_CERT_REQ_LENGTH != length) {
++    error_report("get_certificate: invalid length: %d", length);
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    goto cleanup;
++  }
++
++  cert_index = (get_certificate_index_t *) &index;
++
++  // Get Slot number from "Param1" field in index
++  if (USB_AUTH_MAX_SLOT > cert_index->slot_number) {
++    as->req_slot_index = cert_index->slot_number;
++  } else {
++    error_report("get_certificate: invalid slot requested: %d",
++                  cert_index->slot_number);
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    goto cleanup;
++  }
++
++  // Check that requested slot has been set
++  if (false == as->slots[as->req_slot_index].initialized) {
++    error_report("get_certificate: invalid slot requested: %d", as->req_slot_index);
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    goto cleanup;
++  }
++
++  // Get requested offset and length from data
++  as->req_slot_offset = ((uint16_t *) data)[0];
++  as->req_slot_length = ((uint16_t *) data)[1];
++
++  // Check that the read request is within bounds
++  if (((size_t) as->req_slot_offset+ (size_t) as->req_slot_length)
++        >
++        ((uint16_t *) as->slots[as->req_slot_index].cert)[0]) {
++    error_report("get_certificate: invalid request: cert_length %ld, req_offset: %d, req_length: %d",
++                  as->slots[as->req_slot_index].cert_length,
++                  as->req_slot_offset, as->req_slot_length);
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    goto cleanup;
++  }
++
++  ret = 0;
++
++cleanup:
++  if (-1 == ret) {
++    // Set requested slot to invalid value
++    as->req_slot_index = 255;
++  }
++
++  return ret;
++}
++
++/**
++ * @brief Define a standard CERTIFICATE Response Header as per Table 5-12
++ */
++static const uint8_t auth_certificate_resp[] = {
++  USB_SECURITY_PROTOCOL_VERSION, /**< ProtocolVersion */
++  USB_AUTH_CERTIFICATE_RESP_TYPE, /**< Certificate response type */
++  0x00, /**< Slot number of the certificate chain returned */
++  0x00, /**< Reserved */
++};
++
++/**
++ * @brief Handle a CERTIFICATE Authentication IN control request
++ *
++ * @param [in, out] as : USB Authentication device instance
++ * @param [in, out] p  : USB packet received and response
++ * @param [in] length  : Length of requested data
++ * @param [out] data   : output data buffer
++ *
++ * @return 0 on SUCCESS, else -1
++ */
++static int certificate(struct UsbAuthState *as, USBPacket *p,
++                        const int length, uint8_t *data)
++{
++  // Check that requested index is valid
++  if (USB_AUTH_MAX_SLOT <= as->req_slot_index
++      || false == as->slots[as->req_slot_index].initialized) {
++    error_report("certificate: out requested called without valid in setup");
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    return -1;
++  }
++
++  // Check that expected length is equal to requested length + 4 (response header)
++  if (length != (as->req_slot_length+4)) {
++    error_report("certificate: invalid response length, requested: %d, expected: %d",
++                  as->req_slot_length+4, length);
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    return -1;
++  }
++
++  // response header
++  memcpy(data, auth_certificate_resp, sizeof(auth_certificate_resp));
++
++  memcpy(data + sizeof(auth_certificate_resp),
++          as->slots[as->req_slot_index].cert + as->req_slot_offset,
++          as->req_slot_length);
++
++  p->actual_length = sizeof(auth_digest_resp) + as->req_slot_length;
++
++  // Reset requested index to invalid value
++  as->req_slot_index = 255;
++
++  return 0;
++}
++
++/**
++ * @brief Handle a CHALLENGE Authentication OUT control request
++ *
++ * @param [in, out] as   : USB Authentication device instance
++ * @param [in, out] p    : USB packet received and response
++ * @param [in] value     : wValue request field
++ * @param [in] index     : wIndex request field
++ * @param [in] length    : wLength request field
++ * @param [in, out] data : request input data
++ *
++ * @return 0 on SUCCESS, else -1
++ */
++static int challenge(struct UsbAuthState *as, USBPacket *p,
++                      const int value, const int index,
++                      const int length, uint8_t *data)
++{
++  int ret = -1;
++  get_certificate_index_t *cert_index = NULL;
++
++  // Length of data should be 4
++  if (USB_AUTH_DIGEST_SIZE != length) {
++    error_report("challenge: invalid length: %d", length);
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    goto cleanup;
++  }
++
++  cert_index = (get_certificate_index_t *) &index;
++
++  // Get Slot number from "Param1" field in index
++  if (8 > cert_index->slot_number) {
++    as->req_slot_index = cert_index->slot_number;
++  } else {
++    error_report("challenge: invalid slot requested: %d",
++                  cert_index->slot_number);
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    goto cleanup;
++  }
++
++  // Fill the first part of the challenge with the request message
++  as->challenge[0] = value & 0xFF;
++  as->challenge[1] = (value >> 8) & 0xFF;
++  as->challenge[2] = cert_index->slot_number;
++  as->challenge[3] = cert_index->reserved;
++
++  memcpy(as->challenge + 4, data, USB_AUTH_DIGEST_SIZE);
++
++  ret = 0;
++
++cleanup:
++  if (-1 == ret) {
++    // Set requested slot to invalid value
++    as->req_slot_index = 255;
++  }
++
++  return ret;
++}
++
++/**
++ * @brief CHALLENGE_AUTH response header according to Table 5-14
++ */
++typedef struct __attribute__((packed)) {
++  uint8_t protocol; /**< ProtocolVersion = V1.0 */
++  uint8_t type; /**< MessageType = CHALLENGE_AUTH */
++  uint8_t slot_number; /**< Param1 = requested slot for challenge */
++  uint8_t slot_mask; /**< Param2 = device slot mask */
++} chall_auth_resp_header_t;
++
++/**
++ * @brief Handle a CHALLENGE_AUTH Authentication IN control request
++ *
++ * @param [in] dev     : Handle to UsbDevice instance
++ * @param [in, out] as : USB Authentication device instance
++ * @param [in, out] p  : USB packet received and response
++ * @param [in] value   : wValue request field
++ * @param [in] index   : wIndex request field
++ * @param [in] length  : Length of requested data
++ * @param [out] data   : output data buffer
++ *
++ * @return 0 on SUCCESS, else -1
++ */
++static int challenge_auth(USBDevice *dev, struct UsbAuthState *as,
++                          USBPacket *p,
++                          const int value, const int index,
++                          const int length, uint8_t *data)
++{
++  int ret = -1;
++  int i = 0;
++  chall_auth_resp_header_t header = {
++    .protocol = USB_SECURITY_PROTOCOL_VERSION,
++    .type = USB_AUTH_CHALLENGE_AUTH_RESP_TYPE,
++    .slot_number = 0,
++    .slot_mask = 0,
++  };
++
++  // Check that expected length is 168 B
++  if (USB_AUTH_CHALL_RESP_LENGTH != length) {
++    error_report("challenge_auth: invalid length: %d", length);
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    goto cleanup;
++  }
++
++  header.slot_number = (index >> 8) & 0xFF;
++  header.slot_mask = index & 0xFF;
++
++  if (as->req_slot_index != header.slot_number) {
++    error_report("challenge_auth: requested slot number different than in out\n");
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    goto cleanup;
++  }
++
++  // Check that a valid slot as been selected for the challenge
++  if (USB_AUTH_MAX_SLOT <= as->req_slot_index
++    || false == as->slots[as->req_slot_index].initialized) {
++    error_report("challenge_auth: out requested called without valid in setup");
++    send_auth_error(USB_AUTH_ERROR_INV_REQ, 0, p, data);
++    goto cleanup;
++  }
++
++  header.slot_number = as->req_slot_index;
++  for (i = 0; i < USB_AUTH_MAX_SLOT; i++) {
++    if (true == as->slots[i].initialized) {
++      header.slot_mask |= (1 << i);
++    }
++  }
++
++  // Finish to create challenge and create response
++  // Response header
++  as->challenge[36] = header.protocol;
++  as->challenge[37] = header.type;
++  as->challenge[38] = header.slot_number;
++  as->challenge[39] = header.slot_mask;
++
++  // Response payload
++  as->challenge[40] = USB_SECURITY_PROTOCOL_VERSION;
++  as->challenge[41] = USB_SECURITY_PROTOCOL_VERSION;
++
++  as->challenge[42] = USB_AUTH_CAPABILITY;
++
++  as->challenge[43] = USB_AUTH_ORG_USB_IF;
++
++  memcpy(as->challenge+44, &as->slots[as->req_slot_index].digest, USB_AUTH_DIGEST_SIZE);
++
++  if (-1 == get_salt(as->challenge+76)) {
++    error_report("challenge_auth: failed to get salt");
++    send_auth_error(USB_AUTH_ERROR_UNSPEC, 0, p, data);
++    goto cleanup;
++  }
++
++  if (-1 == get_context_hash(dev, as->challenge+108)) {
++    error_report("challenge_auth: failed to get context hash");
++    send_auth_error(USB_AUTH_ERROR_UNSPEC, 0, p, data);
++    goto cleanup;
++  }
++
++  memcpy(data, as->challenge+36, 104);
++
++  if (-1 == sign_challenge(as->slots[as->req_slot_index].key,
++                            as->challenge, data+104)) {
++    error_report("challenge_auth: failed to sign challenge");
++    send_auth_error(USB_AUTH_ERROR_UNSPEC, 0, p, data);
++    goto cleanup;
++  }
++
++  p->actual_length = USB_AUTH_CHALL_RESP_LENGTH;
++
++  ret = 0;
++
++cleanup:
++  // Reset request slot
++  as->req_slot_index = 255;
++
++  return ret;
++}
++
++static void handle_authent_in(USBDevice *dev, USBPacket *p, int request, int value,
++                          int index, int length, uint8_t *data)
++{
++  struct UsbAuthState *as = USB_AUTH(dev);
++
++  // Value contains wValue = ProtocolVersion | MessageType
++  switch (value) {
++  case USB_SECURITY_PROTOCOL_VERSION << 8 | USB_AUTH_GET_DIGESTS_REQ_TYPE:
++    info_report("handle_authent_in: GET_DIGESTS request");
++    get_digests(as, p, length, data);
++    break;
++  case USB_SECURITY_PROTOCOL_VERSION << 8 | USB_AUTH_CERTIFICATE_RESP_TYPE:
++    info_report("handle_authent_in: CERTIFICATE request");
++    certificate(as, p, length, data);
++    break;
++  case USB_SECURITY_PROTOCOL_VERSION << 8 | USB_AUTH_CHALLENGE_AUTH_RESP_TYPE:
++    info_report("handle_authent_in: CHALLENGE_AUTH request");
++    challenge_auth(dev, as, p, value, index, length, data);
++    break;
++  default:
++    error_report("handle_authent_in: unknown value: %x", value);
++  }
++}
++
++static void handle_authent_out(USBDevice *dev, USBPacket *p, int request, int value,
++                                int index, int length, uint8_t *data)
++{
++  struct UsbAuthState *as = USB_AUTH(dev);
++
++  // Value contains wValue = ProtocolVersion | MessageType
++  switch (value) {
++  case USB_SECURITY_PROTOCOL_VERSION << 8 | USB_AUTH_GET_CERTIFICATE_REQ_TYPE:
++    info_report("handle_authent_out: GET_CERTIFICATE request");
++    get_certificate(as, p, index, length, data);
++    break;
++  case USB_SECURITY_PROTOCOL_VERSION << 8 | USB_AUTH_CHALLENGE_REQ_TYPE:
++    info_report("handle_authent_out: CHALLENGE request");
++    challenge(as, p, value, index, length, data);
++    break;
++  default:
++    error_report("handle_authent_out: unknown value: %x", value);
++  }
++}
++
++////////////////////////////////////////////////////////////////////////////////
++//
++// QEMU USB device functions
++//
++////////////////////////////////////////////////////////////////////////////////
++
++
++static void usb_auth_handle_control(USBDevice *dev, USBPacket *p,
++              int request, int value, int index, int length, uint8_t *data)
++{
++  int ret;
++
++  /* Handle enumeration request */
++  ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
++  if (ret >= 0) {
++    return;
++  }
++
++  /* Handle only authentication requests */
++  switch (request) {
++    case 0x8018: // AUTH_IN
++        info_report("usb_auth_handle_control: AUTH_IN");
++        handle_authent_in(dev, p, request, value, index, length, data);
++        break;
++    case 0x0019: // AUTH_OUT
++        info_report("usb_auth_handle_control: AUTH_OUT");
++        handle_authent_out(dev, p, request, value, index, length, data);
++        break;
++    default:
++        info_report("usb_auth_handle_control: unknown control %x", request);
++        p->status = USB_RET_STALL;
++        break;
++  }
++}
++
++////////////////////////////////////////////////////////////////////////////////
++// Inititialisation functions
++////////////////////////////////////////////////////////////////////////////////
++
++static Property usb_auth_properties[] = {
++  DEFINE_PROP_UINT32("usb_version", UsbAuthState, usb_version, 2),
++  DEFINE_PROP_END_OF_LIST(),
++};
++
++static const VMStateDescription vmstate_usb_auth = {
++  .name = "usb-auth",
++  .version_id = 1,
++  .minimum_version_id = 1,
++  .fields = (const VMStateField[]) {
++    VMSTATE_END_OF_LIST()
++  }
++};
++
++enum {
++  STR_MANUFACTURER = 1,
++  STR_PRODUCT_MOUSE,
++  STR_PRODUCT_TABLET,
++  STR_PRODUCT_KEYBOARD,
++  STR_SERIAL_COMPAT,
++  STR_CONFIG_MOUSE,
++  STR_CONFIG_TABLET,
++  STR_CONFIG_KEYBOARD,
++  STR_SERIAL_MOUSE,
++  STR_SERIAL_TABLET,
++  STR_SERIAL_KEYBOARD,
++};
++
++#define USB_DT_HID    0x21
++#define USB_DT_REPORT 0x22
++
++static const USBDescStrings desc_strings = {
++  [STR_MANUFACTURER]     = "QEMU",
++  [STR_PRODUCT_MOUSE]    = "QEMU USB Mouse",
++  [STR_PRODUCT_TABLET]   = "QEMU USB Tablet",
++  [STR_PRODUCT_KEYBOARD] = "QEMU USB Keyboard",
++  [STR_SERIAL_COMPAT]    = "42",
++  [STR_CONFIG_MOUSE]     = "HID Mouse",
++  [STR_CONFIG_TABLET]    = "HID Tablet",
++  [STR_CONFIG_KEYBOARD]  = "HID Keyboard",
++  [STR_SERIAL_MOUSE]     = "89126",
++  [STR_SERIAL_TABLET]    = "28754",
++  [STR_SERIAL_KEYBOARD]  = "68284",
++};
++
++static const USBDescMSOS desc_msos_suspend = {
++  .SelectiveSuspendEnabled = true,
++};
++
++static const USBDescIface desc_iface_auth = {
++  .bInterfaceNumber              = 0,
++  .bNumEndpoints                 = 1,
++  .bInterfaceClass               = USB_CLASS_HID,
++  .bInterfaceSubClass            = 0x01, /* boot */
++  .bInterfaceProtocol            = 0x02,
++  .ndesc                         = 1,
++  .descs = (USBDescOther[]) {
++      {
++          /* HID descriptor */
++          .data = (uint8_t[]) {
++              0x09,          /*  u8  bLength */
++              USB_DT_HID,    /*  u8  bDescriptorType */
++              0x01, 0x00,    /*  u16 HID_class */
++              0x00,          /*  u8  country_code */
++              0x01,          /*  u8  num_descriptors */
++              USB_DT_REPORT, /*  u8  type: Report */
++              52, 0,         /*  u16 len */
++          },
++      },
++  },
++  .eps = (USBDescEndpoint[]) {
++      {
++          .bEndpointAddress      = USB_DIR_IN | 0x01,
++          .bmAttributes          = USB_ENDPOINT_XFER_INT,
++          .wMaxPacketSize        = 4,
++          .bInterval             = 0x0a,
++      },
++  },
++};
++
++static const USBDescIface desc_iface_auth2 = {
++  .bInterfaceNumber              = 0,
++  .bNumEndpoints                 = 1,
++  .bInterfaceClass               = USB_CLASS_HID,
++  .bInterfaceSubClass            = 0x01, /* boot */
++  .bInterfaceProtocol            = 0x02,
++  .ndesc                         = 1,
++  .descs = (USBDescOther[]) {
++      {
++          /* HID descriptor */
++          .data = (uint8_t[]) {
++              0x09,          /*  u8  bLength */
++              USB_DT_HID,    /*  u8  bDescriptorType */
++              0x01, 0x00,    /*  u16 HID_class */
++              0x00,          /*  u8  country_code */
++              0x01,          /*  u8  num_descriptors */
++              USB_DT_REPORT, /*  u8  type: Report */
++              52, 0,         /*  u16 len */
++          },
++      },
++  },
++  .eps = (USBDescEndpoint[]) {
++      {
++          .bEndpointAddress      = USB_DIR_IN | 0x01,
++          .bmAttributes          = USB_ENDPOINT_XFER_INT,
++          .wMaxPacketSize        = 4,
++          .bInterval             = 7, /* 2 ^ (8-1) * 125 usecs = 8 ms */
++      },
++  },
++};
++
++static const USBDescDevice desc_device_auth = {
++  .bcdUSB                        = 0x0201,
++  .bMaxPacketSize0               = 8,
++  .bNumConfigurations            = 1,
++  .confs = (USBDescConfig[]) {
++      {
++          .bNumInterfaces        = 1,
++          .bConfigurationValue   = 1,
++          .iConfiguration        = STR_CONFIG_MOUSE,
++          .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
++          .bMaxPower             = 50,
++          .nif = 1,
++          .ifs = &desc_iface_auth,
++      },
++  },
++};
++
++static const USBDescDevice desc_device_auth2 = {
++  .bcdUSB                        = 0x0201,
++  .bMaxPacketSize0               = 64,
++  .bNumConfigurations            = 1,
++  .confs = (USBDescConfig[]) {
++      {
++          .bNumInterfaces        = 1,
++          .bConfigurationValue   = 1,
++          .iConfiguration        = STR_CONFIG_MOUSE,
++          .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
++          .bMaxPower             = 50,
++          .nif = 1,
++          .ifs = &desc_iface_auth2,
++      },
++  },
++};
++
++static const USBDesc desc_auth = {
++  .id = {
++      .idVendor          = 0x0627,
++      .idProduct         = 0x0001,
++      .bcdDevice         = 0,
++      .iManufacturer     = STR_MANUFACTURER,
++      .iProduct          = STR_PRODUCT_MOUSE,
++      .iSerialNumber     = STR_SERIAL_MOUSE,
++  },
++  .full = &desc_device_auth,
++  .high = &desc_device_auth2,
++  .str  = desc_strings,
++  .msos = &desc_msos_suspend,
++};
++
++static int parse_json(struct UsbAuthState *as, const char *filename)
++{
++  QIOChannel *ioc = NULL;
++  QEMUFile *f = NULL;
++  QObject *obj = NULL;
++  QObject *slot_obj = NULL;
++  QDict *slot = NULL;
++  QDict *dict = NULL;
++  QList *slots = NULL;
++  const char *key = NULL;
++  const char *cert = NULL;
++  uint8_t *data = NULL;
++  struct stat st;
++  size_t list_size = 0;
++  size_t i = 0;
++  int slot_index = 0;
++  int ret = -1;
++
++  if (stat(filename, &st) < 0) {
++    error_report("stat(json) failed");
++    goto cleanup;
++  }
++
++  ioc = QIO_CHANNEL(qio_channel_file_new_path(filename, O_RDONLY, 0, NULL));
++  f = qemu_file_new_input(ioc);
++
++  if (!f) {
++    error_report("qemu_fopen failed");
++    goto cleanup;
++  }
++
++  object_unref(OBJECT(ioc));
++
++  if (NULL == (data = g_malloc(st.st_size))) {
++    error_report("Failed to initialize object buffer");
++    goto cleanup;
++  }
++  qemu_get_buffer(f, data, st.st_size);
++
++  obj = qobject_from_json((const char*) data, NULL);
++  if (!obj) {
++    error_report("could not parse json");
++    goto cleanup;
++  }
++
++  dict = qobject_to(QDict, obj);
++  if (!dict) {
++    error_report("Invalid JSON object given");
++    goto cleanup;
++  }
++
++  if (NULL == (slots = qdict_get_qlist(dict, "slots"))) {
++    error_report("Did not find slots array");
++    goto cleanup;
++  }
++
++  list_size = qlist_size(slots);
++
++  if (list_size == 0 || list_size > 8) {
++    error_report("Invalid list size");
++    goto cleanup;
++  }
++
++  for (i = 0; i < list_size; i++) {
++    if (NULL == (slot_obj = qlist_pop(slots))) {
++      error_report("Failed to get slot in list");
++      goto cleanup;
++    }
++
++    slot = qobject_to(QDict, slot_obj);
++
++    // Check if slot format is valid
++    if ((0 == qdict_haskey(slot, "slot"))
++        || (0 == qdict_haskey(slot, "key"))
++        || (0 == qdict_haskey(slot, "cert"))) {
++      error_report("Invalid slot: %ld", i);
++      goto cleanup;
++    }
++
++    slot_index = qdict_get_int(slot, "slot");
++
++    if (0 > slot_index || 7 < slot_index) {
++      error_report("Invalid slot index value");
++      goto cleanup;
++    }
++
++    if (NULL == (cert = qdict_get_str(slot, "cert"))) {
++      // Unlikely as key exists
++      error_report("Slot invalid certificate string");
++      goto cleanup;
++    }
++
++    if (-1 == cert_decode_b64(cert, as->slots[slot_index].cert)) {
++      error_report("Failed to decode certificate chain");
++      goto cleanup;
++    }
++
++    if (-1 == create_cert_digest(as->slots[slot_index].cert,
++                                  as->slots[slot_index].digest)) {
++      error_report("Failed to compute certificate chain digest");
++      goto cleanup;
++    }
++
++    mbedtls_x509_crt leaf_crt = {0};
++
++    if (0 != parse_cert_chain(as->slots[slot_index].cert+36,
++                (size_t) ((uint16_t *) as->slots[as->req_slot_index].cert)[0] - 36,
++                &leaf_crt)) {
++      error_report("Failed to get public key from certificate chain");
++      goto cleanup;
++    }
++
++    if (1 == mbedtls_pk_can_do(&(leaf_crt.pk), MBEDTLS_PK_ECDSA)) {
++      fprintf(stdout, "Public can do ECDSA\n");
++    }
++    if (1 == mbedtls_pk_can_do(&(leaf_crt.pk), MBEDTLS_PK_ECKEY)) {
++      fprintf(stdout, "Public can do ECKEY\n");
++    }
++
++    if (NULL == (key = qdict_get_str(slot, "key"))) {
++      // Unlikely as key exists
++      error_report("Slot invalid key string");
++      goto cleanup;
++    }
++
++    if (-1 == load_ecc_pk(key, &(as->slots[slot_index].key))) {
++      error_report("Failed to extract key from slot: %ld", i);
++      error_report("key: %s", key);
++      goto cleanup;
++    }
++
++    as->slots[slot_index].initialized = true;
++  }
++
++  ret = 0;
++
++cleanup:
++  if (obj) {
++    qobject_unref(obj);
++  }
++
++  return ret;
++}
++
++static void usb_auth_realize(USBDevice *dev, Error **errp)
++{
++  int i = 0;
++  const char *fname = NULL;
++  struct UsbAuthState *as = USB_AUTH(dev);
++
++  as->dev.usb_desc = &desc_auth;
++
++  // Create a serial number for the usb device
++  usb_desc_create_serial(dev);
++  // Initialize the USB descriptor
++  usb_desc_init(dev);
++
++  as->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
++
++  for (i = 0; i < 8; i++) {
++    as->slots[i].initialized = false;
++  }
++
++  // Get the configuration file
++  fname = qemu_opt_get(qemu_find_opts_singleton("usb_auth_config"), "usb_auth_config");
++  if (!fname) {
++    error_report("need USB authentication configuration file");
++    exit(EXIT_FAILURE);
++  }
++
++  parse_json(as, fname);
++
++  // Reset requested index to invalid value
++  as->req_slot_index = 255;
++}
++
++static void usb_auth_class_initfn(ObjectClass *klass, void *data)
++{
++  DeviceClass *dc = DEVICE_CLASS(klass);
++  USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
++
++  psa_status_t status;
++  mbedtls_entropy_context entropy;
++  int ret = 0;
++
++  #if !defined(MBEDTLS_PSA_CRYPTO_C) || !defined(MBEDTLS_ECDSA_C) || \
++    defined(MBEDTLS_PSA_CRYPTO_KEY_ID_ENCODE_OWNER)
++  fprintf(stderr, "Mbedtls PSA crypto not supported\n");
++  #endif
++
++  if (PSA_SUCCESS != (status = psa_crypto_init())) {
++    fprintf(stderr, "Failed to initialize PSA crypto\n");
++  }
++
++  // Initialize entropy
++  mbedtls_entropy_init( &entropy );
++
++  const char *personalization = "usb_qemu_auth";
++  mbedtls_ctr_drbg_init( &ctr_drbg );
++  ret = mbedtls_ctr_drbg_seed( &ctr_drbg , mbedtls_entropy_func, &entropy,
++                   (const unsigned char *) personalization,
++                    strlen( personalization ) );
++  if( ret != 0 )
++  {
++    fprintf(stderr, "Failed to initialize random generator, ret: %d\n", ret);
++    fprintf(stderr, "High error code: %s\n", mbedtls_high_level_strerr(ret));
++    fprintf(stderr, "Low error code: %s\n", mbedtls_low_level_strerr(ret));
++  }
++
++  uc->realize = usb_auth_realize;
++  uc->product_desc = "QEMU USB Authentication";
++  uc->handle_control = usb_auth_handle_control;
++  uc->handle_attach = usb_desc_attach;
++
++  dc->vmsd = &vmstate_usb_auth;
++  device_class_set_props(dc, usb_auth_properties);
++  set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static void usb_auth_register_types(void)
++{
++  static const TypeInfo usb_auth_info = {
++    .name = TYPE_USB_AUTH,
++    .parent = TYPE_USB_DEVICE,
++    .instance_size = sizeof(UsbAuthState),
++    .class_init = usb_auth_class_initfn,
++  };
++
++  type_register_static(&usb_auth_info);
++  usb_legacy_register("usb-auth", "auth", NULL);
++}
++
++type_init(usb_auth_register_types)
+diff --git a/hw/usb/dev-hid.c b/hw/usb/dev-hid.c
+index 9e358c934e..c37c8435cd 100644
+--- a/hw/usb/dev-hid.c
++++ b/hw/usb/dev-hid.c
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/thread.h"
+ #include "ui/console.h"
+ #include "hw/usb.h"
+ #include "migration/vmstate.h"
+@@ -35,6 +36,7 @@
+ #include "hw/usb/hid.h"
+ #include "hw/qdev-properties.h"
+ #include "qom/object.h"
++#include "qemu/qemu-print.h"
+ 
+ struct USBHIDState {
+     USBDevice dev;
+@@ -261,7 +263,7 @@ static const USBDescIface desc_iface_keyboard2 = {
+ };
+ 
+ static const USBDescDevice desc_device_mouse = {
+-    .bcdUSB                        = 0x0100,
++    .bcdUSB                        = 0x0201,
+     .bMaxPacketSize0               = 8,
+     .bNumConfigurations            = 1,
+     .confs = (USBDescConfig[]) {
+@@ -278,7 +280,7 @@ static const USBDescDevice desc_device_mouse = {
+ };
+ 
+ static const USBDescDevice desc_device_mouse2 = {
+-    .bcdUSB                        = 0x0200,
++    .bcdUSB                        = 0x0201,
+     .bMaxPacketSize0               = 64,
+     .bNumConfigurations            = 1,
+     .confs = (USBDescConfig[]) {
+@@ -876,4 +878,4 @@ static void usb_hid_register_types(void)
+     usb_legacy_register("usb-kbd", "keyboard", NULL);
+ }
+ 
+-type_init(usb_hid_register_types)
++type_init(usb_hid_register_types)
+\ No newline at end of file
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+index 23f7f7acb5..6325e19380 100644
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -11,6 +11,20 @@ system_ss.add(when: 'CONFIG_USB', if_true: files(
+   'pcap.c',
+ ), if_false: files('bus-stub.c'))
+ 
++openssl_dep = dependency('openssl', version: '>=3.0.0')
++system_ss.add(openssl_dep)
++
++mbedtls_dep = dependency('mbedtls', version: '>= 3.0.0')
++mbedtls_dep = declare_dependency(
++  include_directories: ['/usr/include/mbedtls/'],
++  link_args: [
++    '/usr/lib/libmbedtls.a',
++    '/usr/lib/libmbedx509.a',
++    '/usr/lib/libmbedcrypto.a'
++  ]
++)
++system_ss.add(mbedtls_dep)
++
+ # usb host adapters
+ system_ss.add(when: 'CONFIG_USB_UHCI', if_true: files('hcd-uhci.c'))
+ system_ss.add(when: 'CONFIG_USB_OHCI', if_true: files('hcd-ohci.c'))
+@@ -49,6 +63,8 @@ if host_os != 'windows'
+   system_ss.add(when: 'CONFIG_USB_STORAGE_MTP', if_true: files('dev-mtp.c'))
+ endif
+ 
++system_ss.add(when: 'CONFIG_USB_AUTH', if_true: files('dev-auth.c'))
++
+ # smartcard
+ system_ss.add(when: 'CONFIG_USB_SMARTCARD', if_true: files('dev-smartcard-reader.c'))
+ 
+diff --git a/include/hw/usb.h b/include/hw/usb.h
+index d46d96779a..acc468e48a 100644
+--- a/include/hw/usb.h
++++ b/include/hw/usb.h
+@@ -162,6 +162,7 @@
+ #define USB_DEV_CAP_WIRELESS            0x01
+ #define USB_DEV_CAP_USB2_EXT            0x02
+ #define USB_DEV_CAP_SUPERSPEED          0x03
++#define USB_DEV_CAP_AUTHENT             0x0e
+ 
+ #define USB_CFG_ATT_ONE              (1 << 7) /* should always be set */
+ #define USB_CFG_ATT_SELFPOWER        (1 << 6)
+diff --git a/include/hw/usb/dev-auth.h b/include/hw/usb/dev-auth.h
+new file mode 100644
+index 0000000000..aad0a3c01f
+--- /dev/null
++++ b/include/hw/usb/dev-auth.h
+@@ -0,0 +1,108 @@
++/**
++ * @file dev-auth.h
++ * @author Luc Bonnafoux
++ * @date 25/03/2025
++ *
++ * SPDX-FileCopyrightText: © 2025 ANSSI, Luc Bonnafoux
++ * SPDX-License-Identifier: MIT
++ *
++ * QEMU USB authentication emulation device
++ *
++ * The USB Authentication device is configured via a JSON file provided with the
++ *  '-usb_auth_config file' command line option.
++ * The format of the configuration file is as follows:
++ *
++ * ```json
++ * {
++ *  "slots": [
++ *    {
++ *      "slot": 0, // Slot number
++ *      "key": "-----BEGIN EC PRIVATE KEY-----\n[..Unencrypted private key..]\n-----END EC PRIVATE KEY-----",
++ *      "cert": "[..certificate chain in base64..]"
++ *    },
++ *    {
++ *      "slot": X, // Slot number
++ *      "key": "-----BEGIN EC PRIVATE KEY-----\n[..Unencrypted private key..]\n-----END EC PRIVATE KEY-----",
++ *      "cert": "[..certificate chain in base64..]"
++ *    },
++ *    ... // Max 8 slots
++ *  ]
++ * }
++ * ```
++ */
++
++#ifndef _H_DEV_AUTH_H_
++#define _H_DEV_AUTH_H_
++
++#include "psa/crypto.h"
++
++////////////////////////////////////////////////////////////////////////////////
++// Authentication protocol constants
++////////////////////////////////////////////////////////////////////////////////
++
++#define USB_AUTH_MAX_SLOT 8
++#define USB_AUTH_CHALL_SIZE 140
++#define USB_AUTH_CERT_SIZE 4096
++#define USB_AUTH_DIGEST_SIZE 32
++#define USB_AUTH_SALT_SIZE 32
++#define USB_AUTH_SIGN_SIZE 64
++
++#define USB_SECURITY_PROTOCOL_VERSION 0x10
++#define USB_AUTH_CAPABILITY 0x01
++#define USB_AUTH_ORG_USB_IF 0x00
++
++#define AUTH_IN     0x18
++#define AUTH_OUT    0x19
++
++#define USB_AUTH_DIGEST_RESP_TYPE 0x01
++#define USB_AUTH_CERTIFICATE_RESP_TYPE 0x02
++#define USB_AUTH_CHALLENGE_AUTH_RESP_TYPE 0x03
++#define USB_AUTHENT_ERROR_TYPE 0x7f
++#define USB_AUTH_GET_DIGESTS_REQ_TYPE 0x81
++#define USB_AUTH_GET_CERTIFICATE_REQ_TYPE 0x82
++#define USB_AUTH_CHALLENGE_REQ_TYPE 0x83
++
++#define USB_AUTH_DIGEST_REQ_LENGTH 260
++#define USB_AUTH_GET_CERT_REQ_LENGTH 4
++#define USB_AUTH_CHALL_REQ_LENGTH 4
++#define USB_AUTH_CHALL_RESP_LENGTH 168
++
++#define USB_AUTH_ERROR_INV_REQ  0x01
++#define USB_AUTH_ERROR_UNS_PROT 0x02
++#define USB_AUTH_ERROR_BUSY     0x03
++#define USB_AUTH_ERROR_UNSPEC   0x04
++
++////////////////////////////////////////////////////////////////////////////////
++// USB authentication device
++////////////////////////////////////////////////////////////////////////////////
++
++/**
++ * Represent a device authentication key slot
++ */
++typedef struct slot {
++  bool initialized;
++  size_t cert_length;
++  psa_key_id_t key; /**< Private signature key */
++  uint8_t cert[USB_AUTH_CERT_SIZE]; /**< Certificate chain */
++  uint8_t digest[USB_AUTH_DIGEST_SIZE]; /**< Certificate chain digest */
++} slot_t;
++
++/**
++ * USB Authentication device state
++ */
++struct UsbAuthState{
++  USBDevice dev;
++  USBEndpoint *intr;
++  uint32_t usb_version;
++  slot_t slots[USB_AUTH_MAX_SLOT];
++  // Request state variables
++  uint8_t req_slot_index;
++  uint16_t req_slot_offset;
++  uint16_t req_slot_length;
++  uint8_t challenge[USB_AUTH_CHALL_SIZE];
++};
++
++#define TYPE_USB_AUTH "usb-auth"
++OBJECT_DECLARE_SIMPLE_TYPE(UsbAuthState, USB_AUTH)
++
++#endif // _H_DEV_AUTH_H_
+\ No newline at end of file
+-- 
+2.50.0
+

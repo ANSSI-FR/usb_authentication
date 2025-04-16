@@ -1,0 +1,25 @@
+FROM docker.io/archlinux:latest
+
+RUN pacman-key --init \
+    && pacman -Syyu --noconfirm \
+    && pacman -S --noconfirm --needed \
+        git \
+        python3 \
+        ninja \
+        make \
+        gcc \
+        virtme-ng \
+        pkgconfig \
+        diffutils \
+        flex \
+        bison \
+        bc \
+        python-cryptography \
+        python-jsonschema \
+        python-jinja \
+        cmake \
+        mbedtls \
+        glib2-devel
+
+ARG WD
+WORKDIR ${WD}/testbed/
