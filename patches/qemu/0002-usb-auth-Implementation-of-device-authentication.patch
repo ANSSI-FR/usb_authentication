@@ -1,7 +1,7 @@
 From 7280afad790917040667b10eb3acc7581ebb3e1e Mon Sep 17 00:00:00 2001
 From: Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
 Date: Thu, 12 Jun 2025 15:23:53 +0200
-Subject: [PATCH 2/3] usb/auth: Implementation of device authentication
+Subject: [PATCH 2/5] usb/auth: Implementation of device authentication
 
 Create a new device in order to emulate the authentication protocol as
 defined in the usb security specification.

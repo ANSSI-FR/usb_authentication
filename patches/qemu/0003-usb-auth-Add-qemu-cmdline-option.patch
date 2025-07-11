@@ -1,7 +1,7 @@
 From 2314188049b13e7de68f721e6f0fc72eed361e1a Mon Sep 17 00:00:00 2001
 From: Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
 Date: Thu, 12 Jun 2025 15:25:36 +0200
-Subject: [PATCH 3/3] usb/auth: Add qemu cmdline option
+Subject: [PATCH 3/5] usb/auth: Add qemu cmdline option
 
 Add a new option to provide a configuration in json format.
 The file content is described in include/hw/usb/dev-auth.h

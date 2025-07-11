@@ -17,6 +17,9 @@ RUN pacman-key --init \
         python-cryptography \
         python-jsonschema \
         python-jinja \
+        python-sphinx \
+        python-yaml \
+        which \
         cmake \
         mbedtls \
         glib2-devel

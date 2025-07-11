@@ -1,0 +1,27 @@
+From 668dda11954d1e26aae14f4e2b764d1b4d3ff691 Mon Sep 17 00:00:00 2001
+From: Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
+Date: Tue, 1 Jul 2025 09:38:29 +0200
+Subject: [PATCH 5/5] Fix chall request header
+
+---
+ hw/usb/dev-auth.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/hw/usb/dev-auth.c b/hw/usb/dev-auth.c
+index ed262d7ece..fcd84c5638 100644
+--- a/hw/usb/dev-auth.c
++++ b/hw/usb/dev-auth.c
+@@ -868,8 +868,8 @@ static int challenge(struct UsbAuthState *as, USBPacket *p,
+   }
+ 
+   // Fill the first part of the challenge with the request message
+-  as->challenge[0] = value & 0xFF;
+-  as->challenge[1] = (value >> 8) & 0xFF;
++  as->challenge[0] = (value >> 8) & 0xFF;
++  as->challenge[1] = value & 0xFF;
+   as->challenge[2] = cert_index->slot_number;
+   as->challenge[3] = cert_index->reserved;
+ 
+-- 
+2.50.0
+

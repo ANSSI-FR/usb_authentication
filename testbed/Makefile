@@ -6,17 +6,17 @@ MK_PARENT:=$(realpath $(MK_PATH)../)
 BUILD_DIR	= $(MK_PARENT)
 RESOURCES_DIR	= $(BUILD_DIR)/Resources/
 
-all: build test
+all: build
 
 container_build:
 	podman build --net host --file Containerfile --tag usb_auth . --build-arg WD=$(BUILD_DIR)
 
-CMD := podman run --rm -it \
+PODMAN := podman run --rm -it \
 			--network host \
 			--volume ../:$(BUILD_DIR):Z \
 			usb_auth 
 
-CMD := $(CMD) \
+CMD := $(PODMAN) \
        ./run.sh
 
 build: container_build
@@ -27,6 +27,9 @@ run:
 
 test:
 	./run.sh --test
+
+docs:
+	$(PODMAN) ./run.sh --docs
 
 clean:
 	rm -rf build/*

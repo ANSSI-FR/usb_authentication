@@ -75,7 +75,7 @@ function config_pki() {
 }
 
 function run() {
-	vng --append "loglevel=7" --run "${LINUX_SRC_PATH}" --user root --qemu "${QEMU_BIN_PATH}" --verbose --qemu-opts="${QEMU_OPTS}"
+	vng --append "loglevel=7 usbcore.enforce_authentication=0" --run "${LINUX_SRC_PATH}" --user root --qemu "${QEMU_BIN_PATH}" --verbose --qemu-opts="${QEMU_OPTS}"
 }
 
 function build() {
@@ -87,8 +87,17 @@ function build() {
 }
 
 function test() {
-	vng --append "loglevel=7" --run "${LINUX_SRC_PATH}" --user root --qemu "${QEMU_BIN_PATH}" --verbose --qemu-opts="${QEMU_OPTS}" -- \
 	"${ENGINE_SRC_PATH}/policy_engine" --root_store "${ROOT_STORE_PATH}/"
+}
+
+function docs() {
+	prepare
+	[ ! -d "${LINUX_SRC_PATH}" ] && git clone https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git --depth=1 --branch "${LINUX_VERSION}" "${LINUX_SRC_PATH}"
+	pushd "${LINUX_SRC_PATH}"
+		git reset --hard "${LINUX_VERSION}"
+		git am "${PATCH_SRC_DIR}/linux/"*.patch --no-gpg-sign
+		vng -b htmldocs --config ${LINUX_CONFIG_DIR}/config 
+	popd
 }
 
 for option in "${@}"
@@ -103,8 +112,12 @@ do
 			exit
 		;;
 		--test)
-		    test
-		    exit
+			test
+		    	exit
+		;;
+		--docs)
+			docs
+		    	exit
 		;;
 		*)
 		;;

@@ -6,7 +6,6 @@
  *  - CHECK_CERTIFICATE
  *  - GENERATE_NONCE
  *  - CHECK_CHALLENGE
- *  - REMOVE_DEVICE
  *
  * @author Luc Bonnafoux <luc.bonnafoux@ssi.gouv.fr>
  * @author Nicolas Bouchinet <nicolas.bouchinet@ssi.gouv.fr>
@@ -228,7 +227,6 @@ static int usb_auth_add_slot(const uint8_t *const digest, mbedtls_x509_crt *ctx,
  * @brief Device context
  *
  * They are created after a successful CHECK_DIGEST or CHECK_CERTIFICATE request.
- * They are removed with a REMOVE_DEVICE request from kernel.
  */
 typedef struct usb_auth_device {
   uint32_t id; /**< 32 bit unique ID for the device, supplied by the kernel */
@@ -304,30 +302,6 @@ static int usb_auth_get_device(const uint32_t id, usb_auth_device_t **dev)
       *dev = item;
       pthread_mutex_unlock(&usb_auth_devs_mut);
       return 0;
-    }
-  }
-  pthread_mutex_unlock(&usb_auth_devs_mut);
-
-  return -1;
-}
-
-/**
- * @brief remove a device from the list
- *
- * WARNING: this function might block on the list mutex
- *
- * @param [in] id : unique identifier for the device, supplied by the kernel
- *
- * @return 0 on SUCCESS or an error code
- */
-static int usb_auth_remove_device(const uint32_t id)
-{
-  usb_auth_device_t *dev = NULL;
-
-  pthread_mutex_lock(&usb_auth_devs_mut);
-  LIST_FOREACH(dev, &usb_auth_devs_head, next) {
-    if (dev->id == id) {
-      LIST_REMOVE(dev, next);
     }
   }
   pthread_mutex_unlock(&usb_auth_devs_mut);
@@ -1048,80 +1022,6 @@ cleanup:
 }
 
 /**
- * @brief handler for a REMOVE_DEV request
- *
- * The request must contain:
- *  - USBAUTH_A_REQ_ID
- *  - USBAUTH_A_DEV_ID
- *
- * The response must contain:
- *  - USBAUTH_A_REQ_ID
- *  - USBAUTH_A_ERROR_CODE
- */
-static void pol_eng_remove_dev(const struct nlattr **req)
-{
-  uint32_t req_id = 0;
-  uint32_t dev_id = 0;
-  struct nl_msg *msg = NULL;
-  void *hdr = NULL;
-
-  // Parse request attributes
-  if (!req[USBAUTH_A_REQ_ID]) {
-    // can not respond to kernel
-    fprintf(stderr, "pol_eng_remove_dev: invalid request: no req ID\n");
-    return;
-  }
-
-  req_id = nla_get_u32(req[USBAUTH_A_REQ_ID]);
-
-  if (!req[USBAUTH_A_DEV_ID]) {
-    fprintf(stderr, "pol_eng_remove_dev: invalid request: missing arguments\n");
-    pol_eng_send_error(USBAUTH_CMD_RESP_REMOVE_DEV, req_id, USBAUTH_INVRESP);
-    return;
-  }
-
-  // Handle request
-  dev_id = nla_get_u32(req[USBAUTH_A_DEV_ID]);
-
-  // Try to find device and remove it
-  if (0 != usb_auth_remove_device(dev_id)) {
-    fprintf(stderr, "pol_eng_remove_dev: failed to remove device\n");
-    pol_eng_send_error(USBAUTH_CMD_RESP_REMOVE_DEV, req_id, USBAUTH_INVRESP);
-    return;
-  }
-
-  // Send response
-  if (NULL == (msg = nlmsg_alloc())) {
-    fprintf(stderr, "pol_eng_remove_dev: failed to allocate message\n");
-    return;
-  }
-
-  if (NULL == (hdr = genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, fam, 0, 0,
-                                  USBAUTH_CMD_RESP_REMOVE_DEV, USBAUTH_GENL_VERSION))) {
-    fprintf(stderr, "pol_eng_remove_dev: failed to create header\n");
-    goto cleanup;
-  }
-
-  if (0 > nla_put_u32(msg, USBAUTH_A_REQ_ID, req_id)) {
-    fprintf(stderr, "pol_eng_remove_dev: failed to add request ID\n");
-    goto cleanup;
-  }
-
-  if (0 > nla_put_u8(msg, USBAUTH_A_ERROR_CODE, USBAUTH_OK)) {
-    fprintf(stderr, "pol_eng_remove_dev: failed to add error code\n");
-    goto cleanup;
-  }
-
-  if (0 > nl_send_auto(ucsk, msg)) {
-    fprintf(stderr, "pol_eng_remove_dev: failed to send message\n");
-    goto cleanup;
-  }
-
-cleanup:
-  nlmsg_free(msg);
-}
-
-/**
  * @brief handler for a GENERATE_CHALLENGE request
  *
  * The request must contain:
@@ -1424,11 +1324,6 @@ static int krn_req_handler(struct nl_msg *msg, void *arg)
     case USBAUTH_CMD_CHECK_CERTIFICATE:
       fprintf(stderr, "krn_req_handler: received check certificate command\n");
       pol_eng_check_cert((const struct nlattr **) tb);
-      return NL_OK;
-
-    case USBAUTH_CMD_REMOVE_DEV:
-      fprintf(stderr, "krn_req_handler: received remove device command\n");
-      pol_eng_remove_dev((const struct nlattr **) tb);
       return NL_OK;
 
     case USBAUTH_CMD_GEN_NONCE:
